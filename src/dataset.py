@@ -3,7 +3,7 @@ import re
 import glob
 import torch
 from torch.utils.data import Dataset, DataLoader
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Any
 from src.tokenizer import BPETokenizer
 
 def clean_text(text: str) -> str:
@@ -66,7 +66,7 @@ class DatasetManager:
         self.data_dir = data_dir
         self.tokenizer = tokenizer
 
-    def analyze(() -> Dict[str, any]:
+    def analyze(self) -> Dict[str, Any]:
         """Calculates total files, total characters, total tokens, vocab size, and average length."""
         files = glob.glob(os.path.join(self.data_dir, "*.txt"))
         raw_text = load_all_txt_files(self.data_dir)

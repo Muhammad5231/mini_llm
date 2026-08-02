@@ -1,22 +1,15 @@
-# Model Checkpoints
+# Checkpoints & Models
+checkpoints/
+exports/
 *.pt
 *.pth
-*.bin
 
-# Python Cache
+# Output & Logs
+logs/
+plots/
+
+# Python Cache & Virtual Environments
 __pycache__/
 *.py[cod]
-
-# Virtual Environments
-venv/
-env/
 .venv/
-
-# VS Code Configuration
-.vscode/
-
-# OS specific files
-.DS_Store
-Thumbs.db
-
-.png
+venv/

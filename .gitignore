@@ -1,0 +1,20 @@
+# Model Checkpoints
+*.pt
+*.pth
+*.bin
+
+# Python Cache
+__pycache__/
+*.py[cod]
+
+# Virtual Environments
+venv/
+env/
+.venv/
+
+# VS Code Configuration
+.vscode/
+
+# OS specific files
+.DS_Store
+Thumbs.db

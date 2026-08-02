@@ -15,7 +15,6 @@ def sample_next_token(
 ) -> int:
     logits = logits.squeeze(0)
 
-    # Apply Repetition Penalty
     if repetition_penalty != 1.0 and len(generated_tokens) > 0:
         for token_id in set(generated_tokens):
             if logits[token_id] < 0:
@@ -47,7 +46,7 @@ def sample_next_token(
 
 def generate_stream(model: MiniLLM, tokenizer: BPETokenizer, prompt: str, config):
     """
-    KV-Cache Accelerated Token Generation with Real-Time Terminal Streaming.
+    KV-Cache Accelerated Token Generation with Real-Time Terminal Streaming and Context Clipping.
     """
     model.eval()
     device = torch.device(config.device)
@@ -55,16 +54,23 @@ def generate_stream(model: MiniLLM, tokenizer: BPETokenizer, prompt: str, config
     model.reset_kv_cache()
 
     input_ids = tokenizer.encode(prompt)
-    x = torch.tensor(input_ids, dtype=torch.long, device=device).unsqueeze(0)
+    
+    # Cap input prompt to fit safely inside block_size budget
+    max_prompt_len = max(10, config.block_size - 15)
+    if len(input_ids) > max_prompt_len:
+        input_ids = input_ids[-max_prompt_len:]
 
+    x = torch.tensor(input_ids, dtype=torch.long, device=device).unsqueeze(0)
     generated_ids = []
+
+    # Maximum tokens to generate bounded by remaining context window
+    max_tokens_to_generate = min(config.max_new_tokens, config.block_size - len(input_ids))
 
     with torch.no_grad():
         if config.use_kv_cache:
-            # First forward pass processes entire prompt
             logits, _ = model(x, use_cache=True, start_pos=0)
             
-            for step in range(config.max_new_tokens):
+            for step in range(max_tokens_to_generate):
                 next_token_id = sample_next_token(
                     logits[0, -1, :],
                     generated_ids,
@@ -78,18 +84,15 @@ def generate_stream(model: MiniLLM, tokenizer: BPETokenizer, prompt: str, config
                 if "\n" in decoded_char or next_token_id == tokenizer.encoder.get(config.eos_token, -1):
                     break
 
-                # Stream token directly to terminal stdout
                 sys.stdout.write(decoded_char)
                 sys.stdout.flush()
 
                 generated_ids.append(next_token_id)
                 
-                # Subsequent forward passes process ONLY single new token (O(1) step)
                 x_single = torch.tensor([[next_token_id]], dtype=torch.long, device=device)
                 logits, _ = model(x_single, use_cache=True, start_pos=len(input_ids) + step)
         else:
-            # Standard non-cached generation fallback
-            for _ in range(config.max_new_tokens):
+            for _ in range(max_tokens_to_generate):
                 x_cond = x[:, -config.block_size:]
                 logits, _ = model(x_cond)
                 next_token_id = sample_next_token(
@@ -111,12 +114,11 @@ def generate_stream(model: MiniLLM, tokenizer: BPETokenizer, prompt: str, config
                 generated_ids.append(next_token_id)
                 x = torch.cat((x, torch.tensor([[next_token_id]], device=device)), dim=1)
 
-    print() # New line after generation completes
+    print()
     return tokenizer.decode(generated_ids)
 
 
 def interactive_chat_v3(model: MiniLLM, tokenizer: BPETokenizer, config):
-    """Interactive Chat interface with session history and slash command controls."""
     print("\n--- Mini LLM Version 3 Interactive Shell ---")
     print("Type '/help' for a list of available commands.\n")
 
@@ -132,7 +134,6 @@ def interactive_chat_v3(model: MiniLLM, tokenizer: BPETokenizer, config):
         if not user_input:
             continue
 
-        # Slash Commands Handling
         if user_input.startswith("/"):
             parts = user_input.split()
             cmd = parts[0].lower()
@@ -142,7 +143,7 @@ def interactive_chat_v3(model: MiniLLM, tokenizer: BPETokenizer, config):
                 print("  /help            - Show commands")
                 print("  /clear           - Clear conversation history")
                 print("  /history         - Show session history")
-                print("  /temperature [v] - Set temperature (e.g. /temperature 0.7)")
+                print("  /temperature [v] - Set temperature")
                 print("  /topk [v]        - Set Top-K cutoff")
                 print("  /topp [v]        - Set Top-P cutoff")
                 print("  /max_tokens [v]  - Set max tokens generated")
@@ -180,11 +181,7 @@ def interactive_chat_v3(model: MiniLLM, tokenizer: BPETokenizer, config):
                 print("Unknown command. Type '/help' for list.")
             continue
 
-        # Construct prompt incorporating conversation history context
-        prompt_context = ""
-        for turn in history[-2:]:  # Keep last 2 turns in context memory
-            prompt_context += f"User: {turn['user']}\nAssistant: {turn['assistant']}\n"
-        prompt_context += f"User: {user_input}\nAssistant:"
+        prompt_context = f"User: {user_input}\nAssistant:"
 
         sys.stdout.write("\nMiniLLM > ")
         response = generate_stream(model, tokenizer, prompt_context, config)

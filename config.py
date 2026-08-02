@@ -40,13 +40,13 @@ class Config:
     min_lr: float = 1e-5           # Minimum LR for Cosine Decay
     warmup_epochs: int = 3         # Epochs for linear warmup
     max_grad_norm: float = 1.0     # Gradient clipping threshold
-    early_stopping_patience: int = 5 # Epochs to wait before early stopping
+    early_stopping_patience: int = 10 # Epochs to wait before early stopping
     save_every_n_epochs: int = 5
 
     # Inference & Generation
-    temperature: float = 0.8
-    top_k: int = 20
-    top_p: float = 0.9
+    temperature: float = 0.1
+    top_k: int = 5
+    top_p: float = 0.8
     repetition_penalty: float = 1.2
     max_new_tokens: int = 80
     use_kv_cache: bool = True      # Fast inference with Key-Value Cache

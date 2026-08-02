@@ -17,7 +17,6 @@ class RMSNorm(nn.Module):
         self.gamma = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Calculate RMS: sqrt(mean(x^2) + eps)
         rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
         return x * rms * self.gamma
 
@@ -25,51 +24,41 @@ class RMSNorm(nn.Module):
 class RotaryPositionalEmbedding(nn.Module):
     """
     Rotary Position Embeddings (RoPE) implemented from scratch.
-    
     Rotates Query and Key vectors in 2D vector pairs by angular frequencies.
     """
-    def __init__(self, dim: int, max_len: int = 512, theta: float = 10000.0):
+    def __init__(self, dim: int, max_len: int = 2048, theta: float = 10000.0):
         super().__init__()
         self.dim = dim
-        # Compute frequency rates for feature dimensions
         inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer("inv_freq", inv_freq)
+        
+        # persistent=False keeps buffers out of saved state_dict checkpoints
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-        # Precompute cosine and sine embeddings
         t = torch.arange(max_len, dtype=torch.float)
-        freqs = torch.einsum("i,j->ij", t, self.inv_freq) # Shape: (max_len, dim // 2)
+        freqs = torch.einsum("i,j->ij", t, inv_freq) # Shape: (max_len, dim // 2)
         emb = torch.cat((freqs, freqs), dim=-1)           # Shape: (max_len, dim)
         
-        self.register_buffer("cos_cached", emb.cos().unsqueeze(0).unsqueeze(0)) # (1, 1, max_len, dim)
-        self.register_buffer("sin_cached", emb.sin().unsqueeze(0).unsqueeze(0)) # (1, 1, max_len, dim)
+        self.register_buffer("cos_cached", emb.cos().unsqueeze(0).unsqueeze(0), persistent=False)
+        self.register_buffer("sin_cached", emb.sin().unsqueeze(0).unsqueeze(0), persistent=False)
 
     def _rotate_half(self, x: torch.Tensor) -> torch.Tensor:
-        """Rotates vector halves: [-x2, x1]."""
         x1 = x[..., : self.dim // 2]
         x2 = x[..., self.dim // 2 :]
         return torch.cat((-x2, x1), dim=-1)
 
     def forward(self, x: torch.Tensor, seq_len: int, start_pos: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Extract slices for current sequence range
         cos = self.cos_cached[:, :, start_pos : start_pos + seq_len, :]
         sin = self.sin_cached[:, :, start_pos : start_pos + seq_len, :]
         return cos, sin
 
     def apply_rope(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        """Applies RoPE rotation: x * cos + rotate_half(x) * sin."""
         return (x * cos) + (self._rotate_half(x) * sin)
 
 
 class SwiGLUFeedForward(nn.Module):
-    """
-    Swish-Gated Linear Unit (SwiGLU) Feed-Forward Network.
-    
-    Equation:
-    SwiGLU(x) = (SiLU(x * W_gate) * (x * W_up)) * W_down
-    """
+    """Swish-Gated Linear Unit (SwiGLU) Feed-Forward Network."""
     def __init__(self, n_embd: int, dropout: float = 0.1):
         super().__init__()
-        # Expansion factor ~ 2.66x for SwiGLU balance
         hidden_dim = int(2 * (4 * n_embd) / 3)
         self.w_gate = nn.Linear(n_embd, hidden_dim, bias=False)
         self.w_up = nn.Linear(n_embd, hidden_dim, bias=False)
@@ -83,7 +72,6 @@ class SwiGLUFeedForward(nn.Module):
 class MultiHeadCausalAttention(nn.Module):
     """
     Multi-Head Causal Self-Attention with RoPE & Key-Value (KV) Cache support.
-    Structured to allow easy swapping with Flash Attention interfaces.
     """
     def __init__(self, config):
         super().__init__()
@@ -97,18 +85,18 @@ class MultiHeadCausalAttention(nn.Module):
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
 
-        # Causal mask buffer
+        # persistent=False keeps non-trainable causal mask out of saved state_dict
+        max_mask_len = 2048
         self.register_buffer(
             "causal_mask",
-            torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size)
+            torch.tril(torch.ones(max_mask_len, max_mask_len)).view(1, 1, max_mask_len, max_mask_len),
+            persistent=False
         )
 
-        # KV Cache containers
         self.cache_k: Optional[torch.Tensor] = None
         self.cache_v: Optional[torch.Tensor] = None
 
     def reset_cache(self):
-        """Clears key-value cache between generation steps."""
         self.cache_k = None
         self.cache_v = None
 
@@ -122,20 +110,17 @@ class MultiHeadCausalAttention(nn.Module):
     ) -> torch.Tensor:
         B, T, C = x.size()
 
-        # Compute Q, K, V
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
 
         q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
 
-        # Apply Rotary Position Embedding to Q and K
         if rope is not None:
             cos, sin = rope(q, seq_len=T, start_pos=start_pos)
             q = rope.apply_rope(q, cos, sin)
             k = rope.apply_rope(k, cos, sin)
 
-        # KV Cache Update
         if use_cache:
             if self.cache_k is None or start_pos == 0:
                 self.cache_k = k
@@ -146,13 +131,10 @@ class MultiHeadCausalAttention(nn.Module):
             k = self.cache_k
             v = self.cache_v
 
-        # Sequence length after caching
         total_T = k.size(2)
 
-        # Attention Scaled Dot-Product
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim)) # (B, n_head, T, total_T)
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
 
-        # Apply Causal Mask if not cached generation
         if not use_cache:
             causal = self.causal_mask[:, :, :T, :total_T]
             att = att.masked_fill(causal == 0, float('-inf'))
@@ -163,7 +145,7 @@ class MultiHeadCausalAttention(nn.Module):
         att = F.softmax(att, dim=-1)
         att = self.attn_dropout(att)
 
-        y = att @ v # (B, n_head, T, head_dim)
+        y = att @ v
         y = y.transpose(1, 2).contiguous().view(B, T, C)
 
         return self.resid_dropout(self.c_proj(y))
@@ -207,7 +189,7 @@ class MiniLLM(nn.Module):
         self.config = config
 
         self.tok_emb = nn.Embedding(config.vocab_size, config.n_embd)
-        self.rope = RotaryPositionalEmbedding(config.n_embd // config.n_head, config.block_size) if config.use_rope else None
+        self.rope = RotaryPositionalEmbedding(config.n_embd // config.n_head, max_len=2048) if config.use_rope else None
         self.drop = nn.Dropout(config.dropout)
 
         self.blocks = nn.ModuleList([DecoderBlock(config) for _ in range(config.n_layer)])
@@ -215,7 +197,6 @@ class MiniLLM(nn.Module):
         self.norm_f = RMSNorm(config.n_embd, eps=config.norm_eps) if config.use_rmsnorm else nn.LayerNorm(config.n_embd)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-        # Weight tying
         self.tok_emb.weight = self.lm_head.weight
         self.apply(self._init_weights)
 
@@ -228,7 +209,6 @@ class MiniLLM(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def reset_kv_cache(self):
-        """Resets key-value caches across all decoder layers."""
         for block in self.blocks:
             block.attn.reset_cache()
 
@@ -258,12 +238,9 @@ class MiniLLM(nn.Module):
         return logits, loss
 
     def get_model_summary(self) -> dict:
-        """Calculates parameters, layers, hidden dimensions, and estimated RAM usage."""
         total_params = sum(p.numel() for p in self.parameters())
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        
         size_mb = (total_params * 4) / (1024 * 1024)
-        # Estimated runtime RAM = Model Weights + Gradients + Optimizer States (AdamW = 2x weights)
         estimated_ram_mb = size_mb * 4
 
         return {

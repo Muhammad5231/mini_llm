@@ -1,9 +1,11 @@
 import os
 import argparse
 import json
+from flask import config
 import torch
 
 from config import Config
+from src.model import MiniLLM
 from src.tokenizer import BPETokenizer
 from src.dataset import prepare_data, load_all_txt_files, DatasetManager
 from src.model import MiniLLM
@@ -114,7 +116,7 @@ def main():
 
         checkpoint = torch.load(config.best_model_path, map_location=config.device, weights_only=False)
         model = MiniLLM(config)
-        model.load_state_dict(checkpoint["model_state_dict"])
+        model.load_state_dict(checkpoint["model_state_dict"], strict=False)
 
         interactive_chat_v3(model, tokenizer, config)
 

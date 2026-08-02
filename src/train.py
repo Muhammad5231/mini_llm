@@ -42,7 +42,7 @@ def train_model(model: MiniLLM, train_loader, val_loader, config, resume_path: s
     # Automatic Checkpoint Resuming
     if resume_path and torch.os.path.exists(resume_path):
         print(f"Resuming training from checkpoint: {resume_path}")
-        checkpoint = torch.load(resume_path, map_location=device)
+        checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         start_epoch = checkpoint["epoch"] + 1

@@ -61,7 +61,8 @@ def main():
 
         _, val_loader, _ = prepare_data(config, tokenizer)
         
-        checkpoint = torch.load(config.best_model_path, map_location=config.device)
+        # weights_only=False allows unpickling custom objects like Config safely from local files
+        checkpoint = torch.load(config.best_model_path, map_location=config.device, weights_only=False)
         model = MiniLLM(config)
         model.load_state_dict(checkpoint["model_state_dict"])
 
@@ -79,7 +80,8 @@ def main():
         tokenizer = BPETokenizer.load(config.tokenizer_path)
         config.vocab_size = len(tokenizer.encoder)
 
-        checkpoint = torch.load(config.best_model_path, map_location=config.device)
+        # weights_only=False allows unpickling custom objects like Config safely from local files
+        checkpoint = torch.load(config.best_model_path, map_location=config.device, weights_only=False)
         model = MiniLLM(config)
         model.load_state_dict(checkpoint["model_state_dict"])
 

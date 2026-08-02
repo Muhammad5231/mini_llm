@@ -2,137 +2,221 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Optional, Tuple
 
-class SinusoidalPositionalEncoding(nn.Module):
+class RMSNorm(nn.Module):
     """
-    Fixed Sinusoidal Positional Encoding.
+    Root Mean Square Layer Normalization (RMSNorm) implemented from scratch.
     
-    Equations:
-    PE(pos, 2i)   = sin(pos / (10000^(2i / d_model)))
-    PE(pos, 2i+1) = cos(pos / (10000^(2i / d_model)))
+    Mathematical Equation:
+    y = (x / sqrt( mean(x^2) + eps )) * gamma
     """
-    def __init__(self, n_embd: int, max_len: int = 512):
+    def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
-        pe = torch.zeros(max_len, n_embd)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, n_embd, 2).float() * (-math.log(10000.0) / n_embd))
-        
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0) # Shape: (1, max_len, n_embd)
-        
-        self.register_buffer('pe', pe)
+        self.eps = eps
+        self.gamma = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Add positional encoding vectors up to sequence length T
-        return x + self.pe[:, :x.size(1), :]
+        # Calculate RMS: sqrt(mean(x^2) + eps)
+        rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return x * rms * self.gamma
 
 
-class DynamicMultiHeadAttention(nn.Module):
+class RotaryPositionalEmbedding(nn.Module):
     """
-    Multi-Head Attention supporting both Causal Masking and Dynamic Padding Masking.
+    Rotary Position Embeddings (RoPE) implemented from scratch.
+    
+    Rotates Query and Key vectors in 2D vector pairs by angular frequencies.
     """
-    def __init__(self, n_embd: int, n_head: int, block_size: int, dropout: float = 0.1):
+    def __init__(self, dim: int, max_len: int = 512, theta: float = 10000.0):
         super().__init__()
-        assert n_embd % n_head == 0, "n_embd must be divisible by n_head"
-        self.n_head = n_head
-        self.head_dim = n_embd // n_head
-        
-        self.c_attn = nn.Linear(n_embd, 3 * n_embd, bias=False)
-        self.c_proj = nn.Linear(n_embd, n_embd, bias=False)
-        self.attn_dropout = nn.Dropout(dropout)
-        self.resid_dropout = nn.Dropout(dropout)
+        self.dim = dim
+        # Compute frequency rates for feature dimensions
+        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq)
 
-        # Causal triangular mask (lower triangular = 1, upper triangular = 0)
+        # Precompute cosine and sine embeddings
+        t = torch.arange(max_len, dtype=torch.float)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq) # Shape: (max_len, dim // 2)
+        emb = torch.cat((freqs, freqs), dim=-1)           # Shape: (max_len, dim)
+        
+        self.register_buffer("cos_cached", emb.cos().unsqueeze(0).unsqueeze(0)) # (1, 1, max_len, dim)
+        self.register_buffer("sin_cached", emb.sin().unsqueeze(0).unsqueeze(0)) # (1, 1, max_len, dim)
+
+    def _rotate_half(self, x: torch.Tensor) -> torch.Tensor:
+        """Rotates vector halves: [-x2, x1]."""
+        x1 = x[..., : self.dim // 2]
+        x2 = x[..., self.dim // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    def forward(self, x: torch.Tensor, seq_len: int, start_pos: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Extract slices for current sequence range
+        cos = self.cos_cached[:, :, start_pos : start_pos + seq_len, :]
+        sin = self.sin_cached[:, :, start_pos : start_pos + seq_len, :]
+        return cos, sin
+
+    def apply_rope(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        """Applies RoPE rotation: x * cos + rotate_half(x) * sin."""
+        return (x * cos) + (self._rotate_half(x) * sin)
+
+
+class SwiGLUFeedForward(nn.Module):
+    """
+    Swish-Gated Linear Unit (SwiGLU) Feed-Forward Network.
+    
+    Equation:
+    SwiGLU(x) = (SiLU(x * W_gate) * (x * W_up)) * W_down
+    """
+    def __init__(self, n_embd: int, dropout: float = 0.1):
+        super().__init__()
+        # Expansion factor ~ 2.66x for SwiGLU balance
+        hidden_dim = int(2 * (4 * n_embd) / 3)
+        self.w_gate = nn.Linear(n_embd, hidden_dim, bias=False)
+        self.w_up = nn.Linear(n_embd, hidden_dim, bias=False)
+        self.w_down = nn.Linear(hidden_dim, n_embd, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.dropout(self.w_down(F.silu(self.w_gate(x)) * self.w_up(x)))
+
+
+class MultiHeadCausalAttention(nn.Module):
+    """
+    Multi-Head Causal Self-Attention with RoPE & Key-Value (KV) Cache support.
+    Structured to allow easy swapping with Flash Attention interfaces.
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.head_dim = config.n_embd // config.n_head
+        self.block_size = config.block_size
+
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+
+        # Causal mask buffer
         self.register_buffer(
             "causal_mask",
-            torch.tril(torch.ones(block_size, block_size)).view(1, 1, block_size, block_size)
+            torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size)
         )
 
-    def forward(self, x: torch.Tensor, pad_mask: torch.Tensor = None) -> torch.Tensor:
+        # KV Cache containers
+        self.cache_k: Optional[torch.Tensor] = None
+        self.cache_v: Optional[torch.Tensor] = None
+
+    def reset_cache(self):
+        """Clears key-value cache between generation steps."""
+        self.cache_k = None
+        self.cache_v = None
+
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        rope: Optional[RotaryPositionalEmbedding] = None,
+        use_cache: bool = False,
+        start_pos: int = 0,
+        pad_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         B, T, C = x.size()
 
-        # Query, Key, Value Projections
-        q, k, v = self.c_attn(x).split(C, dim=2)
+        # Compute Q, K, V
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
 
-        # Reshape to (B, n_head, T, head_dim)
         q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
 
-        # Scaled Dot-Product Attention Scores
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim)) # (B, n_head, T, T)
+        # Apply Rotary Position Embedding to Q and K
+        if rope is not None:
+            cos, sin = rope(q, seq_len=T, start_pos=start_pos)
+            q = rope.apply_rope(q, cos, sin)
+            k = rope.apply_rope(k, cos, sin)
 
-        # Combine Causal Mask with Padding Mask
-        causal = self.causal_mask[:, :, :T, :T]
-        att = att.masked_fill(causal == 0, float('-inf'))
-        
-        if pad_mask is not None:
-            # pad_mask is 0 for padding tokens
+        # KV Cache Update
+        if use_cache:
+            if self.cache_k is None or start_pos == 0:
+                self.cache_k = k
+                self.cache_v = v
+            else:
+                self.cache_k = torch.cat([self.cache_k, k], dim=2)
+                self.cache_v = torch.cat([self.cache_v, v], dim=2)
+            k = self.cache_k
+            v = self.cache_v
+
+        # Sequence length after caching
+        total_T = k.size(2)
+
+        # Attention Scaled Dot-Product
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim)) # (B, n_head, T, total_T)
+
+        # Apply Causal Mask if not cached generation
+        if not use_cache:
+            causal = self.causal_mask[:, :, :T, :total_T]
+            att = att.masked_fill(causal == 0, float('-inf'))
+
+        if pad_mask is not None and not use_cache:
             att = att.masked_fill(pad_mask == 0, float('-inf'))
 
         att = F.softmax(att, dim=-1)
         att = self.attn_dropout(att)
 
-        # Compute output vectors
         y = att @ v # (B, n_head, T, head_dim)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
 
         return self.resid_dropout(self.c_proj(y))
 
 
-class FeedForward(nn.Module):
-    """Position-wise Feed-Forward Neural Network with GELU activation."""
-    def __init__(self, n_embd: int, dropout: float = 0.1):
+class DecoderBlock(nn.Module):
+    """Transformer Decoder Layer with RMSNorm, Self-Attention & SwiGLU MLP."""
+    def __init__(self, config):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(n_embd, 4 * n_embd),
-            nn.GELU(),
-            nn.Linear(4 * n_embd, n_embd),
-            nn.Dropout(dropout)
-        )
+        self.norm_1 = RMSNorm(config.n_embd, eps=config.norm_eps) if config.use_rmsnorm else nn.LayerNorm(config.n_embd)
+        self.attn = MultiHeadCausalAttention(config)
+        self.norm_2 = RMSNorm(config.n_embd, eps=config.norm_eps) if config.use_rmsnorm else nn.LayerNorm(config.n_embd)
+        
+        if config.activation_type == "swiglu":
+            self.mlp = SwiGLUFeedForward(config.n_embd, config.dropout)
+        else:
+            self.mlp = nn.Sequential(
+                nn.Linear(config.n_embd, 4 * config.n_embd),
+                nn.GELU() if config.activation_type == "gelu" else nn.ReLU(),
+                nn.Linear(4 * config.n_embd, config.n_embd),
+                nn.Dropout(config.dropout)
+            )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-
-class TransformerBlock(nn.Module):
-    """Transformer Decoder Block with Residual Connections & Layer Normalization."""
-    def __init__(self, n_embd: int, n_head: int, block_size: int, dropout: float = 0.1):
-        super().__init__()
-        self.ln_1 = nn.LayerNorm(n_embd)
-        self.attn = DynamicMultiHeadAttention(n_embd, n_head, block_size, dropout)
-        self.ln_2 = nn.LayerNorm(n_embd)
-        self.mlp = FeedForward(n_embd, dropout)
-
-    def forward(self, x: torch.Tensor, pad_mask: torch.Tensor = None) -> torch.Tensor:
-        x = x + self.attn(self.ln_1(x), pad_mask)
-        x = x + self.mlp(self.ln_2(x))
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        rope: Optional[RotaryPositionalEmbedding] = None,
+        use_cache: bool = False,
+        start_pos: int = 0,
+        pad_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        x = x + self.attn(self.norm_1(x), rope=rope, use_cache=use_cache, start_pos=start_pos, pad_mask=pad_mask)
+        x = x + self.mlp(self.norm_2(x))
         return x
 
 
 class MiniLLM(nn.Module):
-    """Complete Educational Mini LLM Version 2."""
+    """Complete Decoder-Only GPT Language Model (Version 3)."""
     def __init__(self, config):
         super().__init__()
         self.config = config
 
         self.tok_emb = nn.Embedding(config.vocab_size, config.n_embd)
-        self.pos_emb = SinusoidalPositionalEncoding(config.n_embd, config.block_size)
+        self.rope = RotaryPositionalEmbedding(config.n_embd // config.n_head, config.block_size) if config.use_rope else None
         self.drop = nn.Dropout(config.dropout)
 
-        self.blocks = nn.ModuleList([
-            TransformerBlock(config.n_embd, config.n_head, config.block_size, config.dropout)
-            for _ in range(config.n_layer)
-        ])
-
-        self.ln_f = nn.LayerNorm(config.n_embd)
+        self.blocks = nn.ModuleList([DecoderBlock(config) for _ in range(config.n_layer)])
+        
+        self.norm_f = RMSNorm(config.n_embd, eps=config.norm_eps) if config.use_rmsnorm else nn.LayerNorm(config.n_embd)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-        # Weight Tying
+        # Weight tying
         self.tok_emb.weight = self.lm_head.weight
-
-        # Parameter initialization
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
@@ -143,15 +227,26 @@ class MiniLLM(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx: torch.Tensor, targets: torch.Tensor = None, pad_mask: torch.Tensor = None):
+    def reset_kv_cache(self):
+        """Resets key-value caches across all decoder layers."""
+        for block in self.blocks:
+            block.attn.reset_cache()
+
+    def forward(
+        self, 
+        idx: torch.Tensor, 
+        targets: Optional[torch.Tensor] = None, 
+        pad_mask: Optional[torch.Tensor] = None,
+        use_cache: bool = False,
+        start_pos: int = 0
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x = self.tok_emb(idx)
-        x = self.pos_emb(x)
         x = self.drop(x)
 
         for block in self.blocks:
-            x = block(x, pad_mask)
+            x = block(x, rope=self.rope, use_cache=use_cache, start_pos=start_pos, pad_mask=pad_mask)
 
-        x = self.ln_f(x)
+        x = self.norm_f(x)
 
         if targets is not None:
             logits = self.lm_head(x)
@@ -163,16 +258,22 @@ class MiniLLM(nn.Module):
         return logits, loss
 
     def get_model_summary(self) -> dict:
-        """Calculates total parameters, trainable parameters, and model size in MB."""
+        """Calculates parameters, layers, hidden dimensions, and estimated RAM usage."""
         total_params = sum(p.numel() for p in self.parameters())
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        # 4 bytes per float32 parameter
-        size_bytes = total_params * 4
-        size_mb = size_bytes / (1024 * 1024)
+        
+        size_mb = (total_params * 4) / (1024 * 1024)
+        # Estimated runtime RAM = Model Weights + Gradients + Optimizer States (AdamW = 2x weights)
+        estimated_ram_mb = size_mb * 4
 
         return {
             "total_parameters": total_params,
             "trainable_parameters": trainable_params,
             "model_size_mb": round(size_mb, 4),
-            "vocab_size": self.config.vocab_size
+            "estimated_ram_mb": round(estimated_ram_mb, 2),
+            "n_layer": self.config.n_layer,
+            "n_embd": self.config.n_embd,
+            "n_head": self.config.n_head,
+            "vocab_size": self.config.vocab_size,
+            "architecture": "Decoder-Only Transformer (RoPE + RMSNorm + SwiGLU)"
         }

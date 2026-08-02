@@ -3,42 +3,34 @@ import re
 import glob
 import torch
 from torch.utils.data import Dataset, DataLoader
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 from src.tokenizer import BPETokenizer
 
 def clean_text(text: str) -> str:
-    """
-    Data Cleaning Pipeline:
-    1. Replaces weird control characters with space while preserving newlines and punctuation.
-    2. Normalizes multiple spaces/tabs into single space.
-    """
-    # Remove non-printable control characters except standard whitespace/newlines
+    """Removes control characters while preserving standard printable text, newlines, and punctuation."""
     text = re.sub(r'[^\x20-\x7E\n\t]', '', text)
-    # Collapse consecutive space/tab horizontal whitespace
     text = re.sub(r'[ \t]+', ' ', text)
     return text.strip()
 
 def load_all_txt_files(data_dir: str) -> str:
-    """Scans directory for all .txt files, cleans and concatenates their contents."""
+    """Scans data directory, cleans and aggregates text from all .txt files."""
     files = glob.glob(os.path.join(data_dir, "*.txt"))
     if not files:
         raise FileNotFoundError(f"No .txt files found in directory: {data_dir}")
     
-    combined_text = []
+    combined = []
     for fpath in sorted(files):
         with open(fpath, "r", encoding="utf-8") as f:
             raw = f.read()
             cleaned = clean_text(raw)
-            combined_text.append(cleaned)
+            if cleaned:
+                combined.append(cleaned)
             
-    return "\n\n".join(combined_text)
+    return "\n\n".join(combined)
 
 
 class DynamicTextDataset(Dataset):
-    """
-    PyTorch Dataset with chunking and dynamic sequence extraction.
-    Creates sequence samples of length block_size for Next-Token Prediction.
-    """
+    """PyTorch Dataset extracting sequence chunks for next-token prediction."""
     def __init__(self, token_ids: List[int], block_size: int):
         self.data = torch.tensor(token_ids, dtype=torch.long)
         self.block_size = block_size
@@ -53,14 +45,8 @@ class DynamicTextDataset(Dataset):
 
 
 def pad_collate_fn(batch, pad_idx: int):
-    """
-    Dynamic Padding Collation function.
-    Pads shorter sequences in a batch to match the maximum batch sequence length.
-    Returns input batch, target batch, and padding mask tensor.
-    """
+    """Pads short sequences dynamically and generates pad mask."""
     x_list, y_list = zip(*batch)
-    
-    # Calculate maximum actual sequence length in current batch
     max_len = max(len(x) for x in x_list)
     
     padded_x = torch.full((len(batch), max_len), pad_idx, dtype=torch.long)
@@ -70,18 +56,40 @@ def pad_collate_fn(batch, pad_idx: int):
         padded_x[i, :len(x_list[i])] = x_list[i]
         padded_y[i, :len(y_list[i])] = y_list[i]
 
-    # Attention Mask: 1 for real tokens, 0 for padded tokens
     pad_mask = (padded_x != pad_idx).unsqueeze(1).unsqueeze(2) # Shape: (B, 1, 1, T)
-
     return padded_x, padded_y, pad_mask
 
 
+class DatasetManager:
+    """Analyzes datasets and provides summary token/character statistics."""
+    def __init__(self, data_dir: str, tokenizer: BPETokenizer):
+        self.data_dir = data_dir
+        self.tokenizer = tokenizer
+
+    def analyze(() -> Dict[str, any]:
+        """Calculates total files, total characters, total tokens, vocab size, and average length."""
+        files = glob.glob(os.path.join(self.data_dir, "*.txt"))
+        raw_text = load_all_txt_files(self.data_dir)
+        tokens = self.tokenizer.encode(raw_text)
+
+        lines = raw_text.splitlines()
+        avg_line_len = len(raw_text) / max(1, len(lines))
+
+        return {
+            "total_files": len(files),
+            "total_characters": len(raw_text),
+            "total_tokens": len(tokens),
+            "vocab_size": len(self.tokenizer.encoder),
+            "avg_line_length": round(avg_line_len, 2),
+            "file_names": [os.path.basename(f) for f in files]
+        }
+
+
 def prepare_data(config, tokenizer: BPETokenizer):
-    """Loads text files, cleans, tokenizes, splits into train/val loaders."""
+    """Loads, tokenizes, splits data, and returns training/validation DataLoaders."""
     raw_text = load_all_txt_files(config.data_dir)
     token_ids = tokenizer.encode(raw_text)
 
-    # Train / Validation Split (90% Train, 10% Validation)
     split_idx = int(0.9 * len(token_ids))
     train_tokens = token_ids[:split_idx]
     val_tokens = token_ids[split_idx:]
@@ -89,7 +97,7 @@ def prepare_data(config, tokenizer: BPETokenizer):
     train_ds = DynamicTextDataset(train_tokens, config.block_size)
     val_ds = DynamicTextDataset(val_tokens, config.block_size)
 
-    pad_id = tokenizer.encoder[config.pad_token]
+    pad_id = tokenizer.encoder.get(config.pad_token, 0)
 
     train_loader = DataLoader(
         train_ds, 

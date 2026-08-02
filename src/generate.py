@@ -1,3 +1,5 @@
+import sys
+import time
 import torch
 import torch.nn.functional as F
 from src.model import MiniLLM
@@ -11,16 +13,9 @@ def sample_next_token(
     top_p: float = 0.9,
     repetition_penalty: float = 1.2
 ) -> int:
-    """
-    Advanced Autoregressive Sampling:
-    1. Repetition Penalty: Penalizes logits of previously generated tokens.
-    2. Temperature Scaling: Scales logits to adjust sampling randomness.
-    3. Top-K Filtering: Keeps only K highest probability tokens.
-    4. Top-P (Nucleus) Filtering: Keeps smallest token set with cumulative probability >= p.
-    """
-    logits = logits.squeeze(0) # (vocab_size,)
+    logits = logits.squeeze(0)
 
-    # 1. Apply Repetition Penalty
+    # Apply Repetition Penalty
     if repetition_penalty != 1.0 and len(generated_tokens) > 0:
         for token_id in set(generated_tokens):
             if logits[token_id] < 0:
@@ -28,84 +23,171 @@ def sample_next_token(
             else:
                 logits[token_id] /= repetition_penalty
 
-    # 2. Temperature Scaling
     if temperature > 0:
         logits = logits / temperature
 
-    # 3. Top-K Filtering
     if top_k > 0:
         indices_to_remove = logits < torch.topk(logits, min(top_k, logits.size(-1)))[0][..., -1, None]
         logits[indices_to_remove] = float('-inf')
 
-    # 4. Top-P (Nucleus) Filtering
     if top_p < 1.0:
         sorted_logits, sorted_indices = torch.sort(logits, descending=True)
         cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
 
-        # Remove tokens with cumulative probability above top_p
         sorted_indices_to_remove = cumulative_probs > top_p
-        # Shift mask to keep the first token exceeding threshold
         sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
         sorted_indices_to_remove[..., 0] = 0
 
         indices_to_remove = sorted_indices[sorted_indices_to_remove]
         logits[indices_to_remove] = float('-inf')
 
-    # Convert logits to probabilities
     probs = F.softmax(logits, dim=-1)
-    next_token = torch.multinomial(probs, num_samples=1).item()
-    
-    return next_token
+    return torch.multinomial(probs, num_samples=1).item()
 
 
-def generate_response(model: MiniLLM, tokenizer: BPETokenizer, prompt: str, config) -> str:
-    """Generates continuous response text from prompt."""
+def generate_stream(model: MiniLLM, tokenizer: BPETokenizer, prompt: str, config):
+    """
+    KV-Cache Accelerated Token Generation with Real-Time Terminal Streaming.
+    """
     model.eval()
     device = torch.device(config.device)
     model.to(device)
+    model.reset_kv_cache()
 
-    formatted_prompt = f"User: {prompt}\nAssistant:"
-    input_ids = tokenizer.encode(formatted_prompt)
+    input_ids = tokenizer.encode(prompt)
     x = torch.tensor(input_ids, dtype=torch.long, device=device).unsqueeze(0)
 
-    generated_ids = list(input_ids)
-    new_tokens = []
+    generated_ids = []
 
     with torch.no_grad():
-        for _ in range(config.max_new_tokens):
-            x_cond = x[:, -config.block_size:]
-            logits, _ = model(x_cond)
-            next_token_id = sample_next_token(
-                logits[0, -1, :],
-                new_tokens,
-                temperature=config.temperature,
-                top_k=config.top_k,
-                top_p=config.top_p,
-                repetition_penalty=config.repetition_penalty
-            )
+        if config.use_kv_cache:
+            # First forward pass processes entire prompt
+            logits, _ = model(x, use_cache=True, start_pos=0)
+            
+            for step in range(config.max_new_tokens):
+                next_token_id = sample_next_token(
+                    logits[0, -1, :],
+                    generated_ids,
+                    config.temperature,
+                    config.top_k,
+                    config.top_p,
+                    config.repetition_penalty
+                )
 
-            # Stop condition on newline or end-of-sequence
-            decoded_char = tokenizer.decode([next_token_id])
-            if "\n" in decoded_char or next_token_id == tokenizer.encoder.get(config.eos_token, -1):
-                break
+                decoded_char = tokenizer.decode([next_token_id])
+                if "\n" in decoded_char or next_token_id == tokenizer.encoder.get(config.eos_token, -1):
+                    break
 
-            new_tokens.append(next_token_id)
-            x = torch.cat((x, torch.tensor([[next_token_id]], device=device)), dim=1)
+                # Stream token directly to terminal stdout
+                sys.stdout.write(decoded_char)
+                sys.stdout.flush()
 
-    return tokenizer.decode(new_tokens).strip()
+                generated_ids.append(next_token_id)
+                
+                # Subsequent forward passes process ONLY single new token (O(1) step)
+                x_single = torch.tensor([[next_token_id]], dtype=torch.long, device=device)
+                logits, _ = model(x_single, use_cache=True, start_pos=len(input_ids) + step)
+        else:
+            # Standard non-cached generation fallback
+            for _ in range(config.max_new_tokens):
+                x_cond = x[:, -config.block_size:]
+                logits, _ = model(x_cond)
+                next_token_id = sample_next_token(
+                    logits[0, -1, :],
+                    generated_ids,
+                    config.temperature,
+                    config.top_k,
+                    config.top_p,
+                    config.repetition_penalty
+                )
+
+                decoded_char = tokenizer.decode([next_token_id])
+                if "\n" in decoded_char or next_token_id == tokenizer.encoder.get(config.eos_token, -1):
+                    break
+
+                sys.stdout.write(decoded_char)
+                sys.stdout.flush()
+
+                generated_ids.append(next_token_id)
+                x = torch.cat((x, torch.tensor([[next_token_id]], device=device)), dim=1)
+
+    print() # New line after generation completes
+    return tokenizer.decode(generated_ids)
 
 
-def interactive_chat(model: MiniLLM, tokenizer: BPETokenizer, config):
-    """Runs interactive command line chat session."""
-    print("\n--- Mini LLM Version 2 Interactive Chat ---")
-    print("Type a prompt and press Enter. Type 'exit' to quit.\n")
+def interactive_chat_v3(model: MiniLLM, tokenizer: BPETokenizer, config):
+    """Interactive Chat interface with session history and slash command controls."""
+    print("\n--- Mini LLM Version 3 Interactive Shell ---")
+    print("Type '/help' for a list of available commands.\n")
+
+    history = []
 
     while True:
-        prompt = input("User > ").strip()
-        if prompt.lower() == "exit":
+        try:
+            user_input = input("User > ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nExiting chat session.")
             break
-        if not prompt:
+
+        if not user_input:
             continue
 
-        response = generate_response(model, tokenizer, prompt, config)
-        print(f"\nMiniLLM > {response}\n" + "-"*50)
+        # Slash Commands Handling
+        if user_input.startswith("/"):
+            parts = user_input.split()
+            cmd = parts[0].lower()
+
+            if cmd == "/help":
+                print("\nCommands:")
+                print("  /help            - Show commands")
+                print("  /clear           - Clear conversation history")
+                print("  /history         - Show session history")
+                print("  /temperature [v] - Set temperature (e.g. /temperature 0.7)")
+                print("  /topk [v]        - Set Top-K cutoff")
+                print("  /topp [v]        - Set Top-P cutoff")
+                print("  /max_tokens [v]  - Set max tokens generated")
+                print("  /exit            - Exit shell\n")
+
+            elif cmd == "/clear":
+                history.clear()
+                print("Conversation history cleared.")
+
+            elif cmd == "/history":
+                print("\n--- Session History ---")
+                for h in history:
+                    print(f"User: {h['user']}\nAI: {h['assistant']}\n")
+
+            elif cmd == "/temperature" and len(parts) > 1:
+                config.temperature = float(parts[1])
+                print(f"Temperature set to: {config.temperature}")
+
+            elif cmd == "/topk" and len(parts) > 1:
+                config.top_k = int(parts[1])
+                print(f"Top-K set to: {config.top_k}")
+
+            elif cmd == "/topp" and len(parts) > 1:
+                config.top_p = float(parts[1])
+                print(f"Top-P set to: {config.top_p}")
+
+            elif cmd == "/max_tokens" and len(parts) > 1:
+                config.max_new_tokens = int(parts[1])
+                print(f"Max new tokens set to: {config.max_new_tokens}")
+
+            elif cmd == "/exit":
+                print("Goodbye!")
+                break
+            else:
+                print("Unknown command. Type '/help' for list.")
+            continue
+
+        # Construct prompt incorporating conversation history context
+        prompt_context = ""
+        for turn in history[-2:]:  # Keep last 2 turns in context memory
+            prompt_context += f"User: {turn['user']}\nAssistant: {turn['assistant']}\n"
+        prompt_context += f"User: {user_input}\nAssistant:"
+
+        sys.stdout.write("\nMiniLLM > ")
+        response = generate_stream(model, tokenizer, prompt_context, config)
+        print("-" * 50)
+
+        history.append({"user": user_input, "assistant": response})

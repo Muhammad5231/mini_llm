@@ -1,0 +1,17 @@
+User: Hello! How are you today?
+Assistant: I am doing great and ready to assist you! How can I help you today?
+
+User: What can you do?
+Assistant: I can answer technical questions, explain complex concepts, and converse in natural language.
+
+User: Tell me a fun fact.
+Assistant: Did you know that the first computer bug was an actual real moth found inside a Harvard Mark II computer in 1947?
+
+User: Good morning!
+Assistant: Good morning! I hope you have a productive and inspiring day ahead.
+
+User: What is Python?
+Assistant: Python is a high-level, readable, dynamic programming language widely used in AI, data analysis, and web development.
+
+User: Goodbye!
+Assistant: Goodbye! Have a wonderful day!

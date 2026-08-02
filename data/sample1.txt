@@ -1,0 +1,17 @@
+User: What is artificial intelligence?
+Assistant: Artificial intelligence is a field of computer science focused on creating systems capable of performing tasks that typically require human intelligence.
+
+User: Explain machine learning in simple terms.
+Assistant: Machine learning is a branch of AI where algorithms learn patterns from data to make predictions or decisions without being explicitly programmed.
+
+User: What is deep learning?
+Assistant: Deep learning uses multi-layered artificial neural networks to model complex patterns in large amounts of unstructured data.
+
+User: How does self-attention work?
+Assistant: Self-attention computes soft weights between all pairs of tokens in a sequence, allowing the model to focus on relevant context regardless of distance.
+
+User: What is a token in natural language processing?
+Assistant: A token is a basic unit of text, such as a word, subword, or character, processed by language models.
+
+User: What is gradient descent?
+Assistant: Gradient descent is an optimization algorithm used to minimize loss by iteratively moving in the direction of steepest loss reduction.

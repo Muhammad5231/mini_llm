@@ -3,81 +3,93 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class MultiHeadAttention(nn.Module):
+class SinusoidalPositionalEncoding(nn.Module):
     """
-    Multi-Head Causal Self-Attention.
+    Fixed Sinusoidal Positional Encoding.
     
     Equations:
-    Q = X * W_Q,  K = X * W_K,  V = X * W_V
-    Attention(Q, K, V) = softmax( (Q * K^T) / sqrt(d_k) + Mask ) * V
+    PE(pos, 2i)   = sin(pos / (10000^(2i / d_model)))
+    PE(pos, 2i+1) = cos(pos / (10000^(2i / d_model)))
     """
-    def __init__(self, n_embd: int, n_head: int, block_size: int):
+    def __init__(self, n_embd: int, max_len: int = 512):
+        super().__init__()
+        pe = torch.zeros(max_len, n_embd)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, n_embd, 2).float() * (-math.log(10000.0) / n_embd))
+        
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0) # Shape: (1, max_len, n_embd)
+        
+        self.register_buffer('pe', pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Add positional encoding vectors up to sequence length T
+        return x + self.pe[:, :x.size(1), :]
+
+
+class DynamicMultiHeadAttention(nn.Module):
+    """
+    Multi-Head Attention supporting both Causal Masking and Dynamic Padding Masking.
+    """
+    def __init__(self, n_embd: int, n_head: int, block_size: int, dropout: float = 0.1):
         super().__init__()
         assert n_embd % n_head == 0, "n_embd must be divisible by n_head"
-        
         self.n_head = n_head
         self.head_dim = n_embd // n_head
         
-        # Single projection linear layer for Q, K, V for speed
         self.c_attn = nn.Linear(n_embd, 3 * n_embd, bias=False)
-        # Output projection
         self.c_proj = nn.Linear(n_embd, n_embd, bias=False)
+        self.attn_dropout = nn.Dropout(dropout)
+        self.resid_dropout = nn.Dropout(dropout)
 
-        # Lower triangular causal mask to prevent attention to future tokens
-        # Shape: (1, 1, block_size, block_size)
+        # Causal triangular mask (lower triangular = 1, upper triangular = 0)
         self.register_buffer(
-            "bias", 
+            "causal_mask",
             torch.tril(torch.ones(block_size, block_size)).view(1, 1, block_size, block_size)
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, C = x.size() # Batch size, Sequence length, Embedding dimension
+    def forward(self, x: torch.Tensor, pad_mask: torch.Tensor = None) -> torch.Tensor:
+        B, T, C = x.size()
 
-        # Calculate Query, Key, Value vectors for all heads in batch
-        # q, k, v shape: (B, T, C)
+        # Query, Key, Value Projections
         q, k, v = self.c_attn(x).split(C, dim=2)
 
-        # Reshape for multi-head attention: (B, n_head, T, head_dim)
-        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        # Reshape to (B, n_head, T, head_dim)
         q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
 
-        # Scaled Dot-Product Attention
-        # Scaled scores = (Q @ K^T) / sqrt(head_dim)
-        # Shape: (B, n_head, T, T)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
+        # Scaled Dot-Product Attention Scores
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim)) # (B, n_head, T, T)
+
+        # Combine Causal Mask with Padding Mask
+        causal = self.causal_mask[:, :, :T, :T]
+        att = att.masked_fill(causal == 0, float('-inf'))
         
-        # Apply causal mask: set future positions to -infinity so softmax makes them 0
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-        
-        # Softmax along last dimension to get attention weights sum to 1
+        if pad_mask is not None:
+            # pad_mask is 0 for padding tokens
+            att = att.masked_fill(pad_mask == 0, float('-inf'))
+
         att = F.softmax(att, dim=-1)
-        
-        # Weighted sum of values: (B, n_head, T, T) @ (B, n_head, T, head_dim) -> (B, n_head, T, head_dim)
-        y = att @ v 
-        
-        # Re-assemble all head outputs side-by-side
-        # Shape: (B, T, C)
+        att = self.attn_dropout(att)
+
+        # Compute output vectors
+        y = att @ v # (B, n_head, T, head_dim)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
 
-        # Output projection
-        return self.c_proj(y)
+        return self.resid_dropout(self.c_proj(y))
 
 
 class FeedForward(nn.Module):
-    """
-    Position-wise Feed-Forward Network (MLP).
-    
-    Equation:
-    FFN(x) = GELU(x * W_1 + b_1) * W_2 + b_2
-    Standard expansion factor is 4x hidden dimension.
-    """
-    def __init__(self, n_embd: int):
+    """Position-wise Feed-Forward Neural Network with GELU activation."""
+    def __init__(self, n_embd: int, dropout: float = 0.1):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(n_embd, 4 * n_embd),
             nn.GELU(),
-            nn.Linear(4 * n_embd, n_embd)
+            nn.Linear(4 * n_embd, n_embd),
+            nn.Dropout(dropout)
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -85,109 +97,82 @@ class FeedForward(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    """
-    Standard Decoder Transformer Block.
-    Uses Pre-LayerNormalization architecture:
-    x = x + SelfAttention(LayerNorm(x))
-    x = x + FeedForward(LayerNorm(x))
-    """
-    def __init__(self, n_embd: int, n_head: int, block_size: int):
+    """Transformer Decoder Block with Residual Connections & Layer Normalization."""
+    def __init__(self, n_embd: int, n_head: int, block_size: int, dropout: float = 0.1):
         super().__init__()
         self.ln_1 = nn.LayerNorm(n_embd)
-        self.attn = MultiHeadAttention(n_embd, n_head, block_size)
+        self.attn = DynamicMultiHeadAttention(n_embd, n_head, block_size, dropout)
         self.ln_2 = nn.LayerNorm(n_embd)
-        self.mlp = FeedForward(n_embd)
+        self.mlp = FeedForward(n_embd, dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Residual Connections (x + ...)
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x: torch.Tensor, pad_mask: torch.Tensor = None) -> torch.Tensor:
+        x = x + self.attn(self.ln_1(x), pad_mask)
         x = x + self.mlp(self.ln_2(x))
         return x
 
 
 class MiniLLM(nn.Module):
-    """
-    Complete Causal Decoder Transformer Language Model.
-    
-    Total parameters formula roughly:
-    Params = Vocab_Size * Embed_Size + Layers * (4 * Embed_Size^2 + 8 * Embed_Size^2)
-    """
-    def __init__(self, vocab_size: int, n_embd: int = 64, n_layer: int = 2, n_head: int = 2, block_size: int = 64):
+    """Complete Educational Mini LLM Version 2."""
+    def __init__(self, config):
         super().__init__()
-        self.block_size = block_size
+        self.config = config
 
-        # Token Embedding Table: Maps token index -> vector of size n_embd
-        self.tok_emb = nn.Embedding(vocab_size, n_embd)
-        
-        # Positional Embedding Table: Maps position index (0 to block_size-1) -> vector
-        self.pos_emb = nn.Embedding(block_size, n_embd)
+        self.tok_emb = nn.Embedding(config.vocab_size, config.n_embd)
+        self.pos_emb = SinusoidalPositionalEncoding(config.n_embd, config.block_size)
+        self.drop = nn.Dropout(config.dropout)
 
-        # Stack of Transformer blocks
         self.blocks = nn.ModuleList([
-            TransformerBlock(n_embd, n_head, block_size) for _ in range(n_layer)
+            TransformerBlock(config.n_embd, config.n_head, config.block_size, config.dropout)
+            for _ in range(config.n_layer)
         ])
 
-        # Final Layer Normalization
-        self.ln_f = nn.LayerNorm(n_embd)
+        self.ln_f = nn.LayerNorm(config.n_embd)
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-        # Language Model Head (maps embedding vectors to vocabulary logits)
-        self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
-
-        # Weight tying (share weights between token embedding and final projection)
+        # Weight Tying
         self.tok_emb.weight = self.lm_head.weight
 
-    def forward(self, idx: torch.Tensor, targets: torch.Tensor = None) -> tuple[torch.Tensor, torch.Tensor]:
-        B, T = idx.size()
-        assert T <= self.block_size, f"Cannot forward sequence of length {T}, block size is {self.block_size}"
+        # Parameter initialization
+        self.apply(self._init_weights)
 
-        # Get positions array [0, 1, ..., T-1]
-        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-        # Combine Token Embeddings and Positional Embeddings
-        # Token Emb: (B, T, n_embd), Pos Emb: (T, n_embd) -> Broadcasted addition
-        x = self.tok_emb(idx) + self.pos_emb(pos)
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor = None, pad_mask: torch.Tensor = None):
+        x = self.tok_emb(idx)
+        x = self.pos_emb(x)
+        x = self.drop(x)
 
-        # Forward pass through all Transformer Blocks
         for block in self.blocks:
-            x = block(x)
+            x = block(x, pad_mask)
 
-        x = self.ln_f(x) # (B, T, n_embd)
+        x = self.ln_f(x)
 
         if targets is not None:
-            # Compute logits for all vocabulary characters
-            logits = self.lm_head(x) # (B, T, vocab_size)
-            
-            # Reshape tensors for PyTorch CrossEntropyLoss calculation
-            # Loss = -log( softmax(logits_true_class) )
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            logits = self.lm_head(x)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-100)
         else:
-            # Inference optimization: focus only on the last time step logits
-            logits = self.lm_head(x[:, -1:, :]) # (B, 1, vocab_size)
+            logits = self.lm_head(x[:, -1:, :])
             loss = None
 
         return logits, loss
 
-    @torch.no_grad()
-    def generate(self, idx: torch.Tensor, max_new_tokens: int) -> torch.Tensor:
-        """
-        Autoregressive generation loop.
-        Appends predictions to context step by step.
-        """
-        for _ in range(max_new_tokens):
-            # Crop current sequence to max context window size if it exceeds block_size
-            idx_cond = idx[:, -self.block_size:]
-            
-            # Get predictions
-            logits, _ = self(idx_cond)
-            
-            # Select last token logits and convert to probabilities using Softmax
-            logits = logits[:, -1, :] # (B, vocab_size)
-            probs = F.softmax(logits, dim=-1) # (B, vocab_size)
-            
-            # Sample next token from categorical distribution
-            idx_next = torch.multinomial(probs, num_samples=1) # (B, 1)
-            
-            # Append sampled token to current sequence
-            idx = torch.cat((idx, idx_next), dim=1)
-            
-        return idx
+    def get_model_summary(self) -> dict:
+        """Calculates total parameters, trainable parameters, and model size in MB."""
+        total_params = sum(p.numel() for p in self.parameters())
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        # 4 bytes per float32 parameter
+        size_bytes = total_params * 4
+        size_mb = size_bytes / (1024 * 1024)
+
+        return {
+            "total_parameters": total_params,
+            "trainable_parameters": trainable_params,
+            "model_size_mb": round(size_mb, 4),
+            "vocab_size": self.config.vocab_size
+        }

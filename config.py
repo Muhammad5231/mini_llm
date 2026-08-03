@@ -27,7 +27,7 @@ class Config:
     n_embd: int = 64
     n_layer: int = 2
     n_head: int = 2
-    block_size: int = 64
+    block_size: int = 128
     dropout: float = 0.1
     norm_eps: float = 1e-5
     activation_type: str = "swiglu"
@@ -37,19 +37,19 @@ class Config:
     # Training & Optimization
     batch_size: int = 8
     grad_accum_steps: int = 2
-    epochs: int = 30
-    learning_rate: float = 1e-3
+    epochs: int = 40
+    learning_rate: float = 8e-4
     min_lr: float = 1e-5
     warmup_epochs: int = 3
     max_grad_norm: float = 1.0
-    early_stopping_patience: int = 10
+    early_stopping_patience: int = 12
     save_every_n_epochs: int = 5
 
     # Inference & Sampling
     temperature: float = 0.1
-    top_k: int = 5
+    top_k: int = 3
     top_p: float = 0.8
-    repetition_penalty: float = 1.2
+    repetition_penalty: float = 1.3
     max_new_tokens: int = 80
     use_kv_cache: bool = True
 
@@ -57,8 +57,8 @@ class Config:
     enable_memory: bool = True
     memory_history_limit: int = 5
     enable_rag: bool = True
-    rag_top_k: int = 2
-    rag_chunk_size: int = 120
+    rag_top_k: int = 1
+    rag_chunk_size: int = 40
     api_host: str = "127.0.0.1"
     api_port: int = 8000
     enable_tools: bool = True

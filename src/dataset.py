@@ -1,31 +1,75 @@
 import os
 import re
 import glob
+import hashlib
 import torch
 from torch.utils.data import Dataset, DataLoader
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
 from src.tokenizer import BPETokenizer
 
+def scan_txt_files_recursively(data_dir: str) -> List[str]:
+    """
+    CRITICAL BUG FIX:
+    Recursively scans directory and ALL subdirectories at unlimited depth for .txt files.
+    Examples matched:
+    - data/input.txt
+    - data/english/Wikipedia/computer.txt
+    - data/hinglish/Conversation.txt
+    """
+    txt_files = []
+    if not os.path.exists(data_dir):
+        raise FileNotFoundError(f"Data directory does not exist: {data_dir}")
+
+    for root, _, files in os.walk(data_dir):
+        for file in files:
+            if file.lower().endswith(".txt"):
+                txt_files.append(os.path.join(root, file))
+
+    if not txt_files:
+        raise FileNotFoundError(f"No .txt files found in '{data_dir}' or any of its subdirectories.")
+    
+    return sorted(txt_files)
+
+
+def read_file_with_fallback_encoding(filepath: str) -> str:
+    """Reads file attempting UTF-8 first, falling back to Latin-1 and CP1252 if needed."""
+    encodings = ["utf-8", "utf-8-sig", "latin-1", "cp1252"]
+    for enc in encodings:
+        try:
+            with open(filepath, "r", encoding=enc) as f:
+                return f.read()
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    # Force read ignoring errors if all fail
+    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+        return f.read()
+
+
 def clean_text(text: str) -> str:
-    """Removes control characters while preserving standard printable text, newlines, and punctuation."""
-    text = re.sub(r'[^\x20-\x7E\n\t]', '', text)
+    """Data Cleaning: Preserves standard characters, punctuation, whitespace, and newlines."""
+    text = re.sub(r'[^\x20-\x7E\n\tĠ]', '', text)
     text = re.sub(r'[ \t]+', ' ', text)
     return text.strip()
 
+
 def load_all_txt_files(data_dir: str) -> str:
-    """Scans data directory, cleans and aggregates text from all .txt files."""
-    files = glob.glob(os.path.join(data_dir, "*.txt"))
-    if not files:
-        raise FileNotFoundError(f"No .txt files found in directory: {data_dir}")
-    
+    """Scans all nested subfolders, cleans text, removes duplicate documents, and concatenates."""
+    files = scan_txt_files_recursively(data_dir)
+    seen_hashes = set()
     combined = []
-    for fpath in sorted(files):
-        with open(fpath, "r", encoding="utf-8") as f:
-            raw = f.read()
-            cleaned = clean_text(raw)
-            if cleaned:
-                combined.append(cleaned)
-            
+
+    for fpath in files:
+        raw = read_file_with_fallback_encoding(fpath)
+        cleaned = clean_text(raw)
+        if not cleaned:
+            continue
+
+        # Hash-based duplicate removal
+        doc_hash = hashlib.md5(cleaned.encode("utf-8")).hexdigest()
+        if doc_hash not in seen_hashes:
+            seen_hashes.add(doc_hash)
+            combined.append(cleaned)
+
     return "\n\n".join(combined)
 
 
@@ -61,32 +105,38 @@ def pad_collate_fn(batch, pad_idx: int):
 
 
 class DatasetManager:
-    """Analyzes datasets and provides summary token/character statistics."""
+    """Dataset Manager: Deep recursive statistics, language detection, and duplicate audit."""
     def __init__(self, data_dir: str, tokenizer: BPETokenizer):
         self.data_dir = data_dir
         self.tokenizer = tokenizer
 
     def analyze(self) -> Dict[str, Any]:
-        """Calculates total files, total characters, total tokens, vocab size, and average length."""
-        files = glob.glob(os.path.join(self.data_dir, "*.txt"))
+        """Calculates file count, nested directory stats, token stats, and duplicate metrics."""
+        files = scan_txt_files_recursively(self.data_dir)
         raw_text = load_all_txt_files(self.data_dir)
         tokens = self.tokenizer.encode(raw_text)
 
-        lines = raw_text.splitlines()
-        avg_line_len = len(raw_text) / max(1, len(lines))
+        lines = [line for line in raw_text.splitlines() if line.strip()]
+        
+        # Simple Language Heuristic
+        hinglish_keywords = ["hai", "kya", "aur", "kaise", "raha", "ho", "sakte"]
+        hinglish_count = sum(raw_text.lower().count(kw) for kw in hinglish_keywords)
+        detected_lang = "Hinglish / English Mixed" if hinglish_count > 5 else "English"
 
         return {
-            "total_files": len(files),
+            "total_files_discovered": len(files),
+            "detected_primary_language": detected_lang,
             "total_characters": len(raw_text),
             "total_tokens": len(tokens),
             "vocab_size": len(self.tokenizer.encoder),
-            "avg_line_length": round(avg_line_len, 2),
-            "file_names": [os.path.basename(f) for f in files]
+            "total_non_empty_lines": len(lines),
+            "avg_line_length": round(len(raw_text) / max(1, len(lines)), 2),
+            "file_paths": [os.path.relpath(f, self.data_dir) for f in files]
         }
 
 
 def prepare_data(config, tokenizer: BPETokenizer):
-    """Loads, tokenizes, splits data, and returns training/validation DataLoaders."""
+    """Loads, tokenizes, splits data recursively, and returns DataLoaders."""
     raw_text = load_all_txt_files(config.data_dir)
     token_ids = tokenizer.encode(raw_text)
 

@@ -1,23 +1,25 @@
 import os
 import argparse
 import json
-from flask import config
 import torch
 
 from config import Config
-from src.model import MiniLLM
 from src.tokenizer import BPETokenizer
 from src.dataset import prepare_data, load_all_txt_files, DatasetManager
 from src.model import MiniLLM
 from src.train import train_model
 from src.evaluate import evaluate_model
-from src.generate import interactive_chat_v3
+from src.generate import interactive_chat_v4
+from src.rag.rag import RAGPipeline
+from src.api.api import start_api_server
 
 def main():
-    parser = argparse.ArgumentParser(description="Mini LLM Version 3 Controller")
+    parser = argparse.ArgumentParser(description="Mini LLM Version 4 Master Controller")
     parser.add_argument("--mode", type=str, default="train", 
-                        choices=["train_tokenizer", "train", "eval", "chat", "analyze", "export", "test"])
+                        choices=["train_tokenizer", "train", "eval", "chat", "analyze", "rag", "api", "export", "import", "test"])
     parser.add_argument("--resume", action="store_true", help="Resume training from latest checkpoint")
+    parser.add_argument("--query", type=str, default="", help="Query for RAG mode")
+    parser.add_argument("--import_path", type=str, default="", help="Path for importing bundle")
     args = parser.parse_args()
 
     config = Config()
@@ -28,7 +30,7 @@ def main():
         os.system("python -m unittest discover -s tests")
 
     elif args.mode == "train_tokenizer":
-        print("Training Byte-Pair Encoding (BPE) Tokenizer from scratch...")
+        print("Training Byte-Pair Encoding (BPE) Tokenizer recursively across data/...")
         text_corpus = load_all_txt_files(config.data_dir)
         tokenizer = BPETokenizer(
             vocab_size=config.vocab_size,
@@ -48,16 +50,16 @@ def main():
         tokenizer = BPETokenizer.load(config.tokenizer_path)
         manager = DatasetManager(config.data_dir, tokenizer)
         stats = manager.analyze()
-        print("\n" + "="*40)
-        print(" Dataset Analysis Summary")
-        print("="*40)
+        print("\n" + "="*50)
+        print(" Dataset Analysis Summary (Version 4)")
+        print("="*50)
         for k, v in stats.items():
-            print(f"{k:<20}: {v}")
-        print("="*40)
+            print(f"{k:<30}: {v}")
+        print("="*50)
 
     elif args.mode == "train":
         if not os.path.exists(config.tokenizer_path):
-            print("Tokenizer not found! Training tokenizer first...")
+            print("Tokenizer not found! Auto-training tokenizer first...")
             os.system("python run.py --mode train_tokenizer")
 
         tokenizer = BPETokenizer.load(config.tokenizer_path)
@@ -80,16 +82,51 @@ def main():
 
         checkpoint = torch.load(config.best_model_path, map_location=config.device, weights_only=False)
         model = MiniLLM(config)
-        model.load_state_dict(checkpoint["model_state_dict"])
+        model.load_state_dict(checkpoint["model_state_dict"], strict=False)
 
         metrics = evaluate_model(model, val_loader, config.device)
-        print("\n" + "="*40)
-        print(" Evaluation Metrics")
-        print("="*40)
-        print(f"Validation Loss : {metrics['val_loss']}")
-        print(f"Perplexity (PPL): {metrics['perplexity']}")
-        print(f"Token Accuracy  : {metrics['accuracy_percent']}%")
-        print("="*40)
+        print("\n" + "="*50)
+        print(" Evaluation Metrics & Benchmarks")
+        print("="*50)
+        for k, v in metrics.items():
+            print(f"{k:<25}: {v}")
+        print("="*50)
+
+    elif args.mode == "rag":
+        rag = RAGPipeline(chunk_size=config.rag_chunk_size)
+        rag.index_directory(config.data_dir)
+        query = args.query if args.query else "What is machine learning?"
+        print(f"\nQuerying RAG Vector DB for: '{query}'\n")
+        context = rag.retrieve_context(query, top_k=2)
+        print(context)
+
+    elif args.mode == "api":
+        if not os.path.exists(config.best_model_path):
+            print("No trained checkpoint found. Please train the model first.")
+            return
+
+        tokenizer = BPETokenizer.load(config.tokenizer_path)
+        config.vocab_size = len(tokenizer.encoder)
+
+        checkpoint = torch.load(config.best_model_path, map_location=config.device, weights_only=False)
+        model = MiniLLM(config)
+        model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+
+        start_api_server(model, tokenizer, config)
+
+    elif args.mode == "chat":
+        if not os.path.exists(config.best_model_path):
+            print("No trained checkpoint found. Please train the model first.")
+            return
+
+        tokenizer = BPETokenizer.load(config.tokenizer_path)
+        config.vocab_size = len(tokenizer.encoder)
+
+        checkpoint = torch.load(config.best_model_path, map_location=config.device, weights_only=False)
+        model = MiniLLM(config)
+        model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+
+        interactive_chat_v4(model, tokenizer, config)
 
     elif args.mode == "export":
         if not os.path.exists(config.best_model_path):
@@ -105,20 +142,6 @@ def main():
         with open(export_manifest, "w", encoding="utf-8") as f:
             json.dump(export_bundle, f, indent=2)
         print(f"Model bundle exported successfully to: {config.export_dir}")
-
-    elif args.mode == "chat":
-        if not os.path.exists(config.best_model_path):
-            print("No trained checkpoint found. Please train the model first.")
-            return
-
-        tokenizer = BPETokenizer.load(config.tokenizer_path)
-        config.vocab_size = len(tokenizer.encoder)
-
-        checkpoint = torch.load(config.best_model_path, map_location=config.device, weights_only=False)
-        model = MiniLLM(config)
-        model.load_state_dict(checkpoint["model_state_dict"], strict=False)
-
-        interactive_chat_v3(model, tokenizer, config)
 
 if __name__ == "__main__":
     main()
